@@ -2,110 +2,185 @@ import streamlit as st
 import joblib
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib import font_manager, rc
+import plotly.graph_objects as go
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
-# [수정] 한글 폰트 설정 (윈도우 기준)
-try:
-    font_path = "C:/Windows/Fonts/malgun.ttf"
-    font_name = font_manager.FontProperties(fname=font_path).get_name()
-    rc('font', family=font_name)
-except:
-    pass # 맥/리눅스 환경일 경우 기본 폰트 사용
+# 1. 페이지 설정 및 디자인 커스텀 (상단 여백 최소화)
+st.set_page_config(page_title="Adidas Intelligence Dashboard", layout="wide")
 
-st.set_page_config(page_title="Adidas USA 2026 AI", layout="wide")
-st.title("👟 Adidas USA 2026 Sales Strategy")
+st.markdown("""
+    <style>
+    /* 상단 여백 및 불필요한 요소 제거 */
+    .block-container { padding-top: 1rem !important; padding-bottom: 0rem !important; }
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+    header { visibility: hidden; }
+    
+    /* 사이드바 너비 조절 */
+    [data-testid="stSidebar"] { width: 220px !important; }
+    
+    /* 뉴스 폰트 조절 */
+    .small-font { font-size: 13.5px !important; line-height: 1.4; margin-bottom: 8px; }
+    </style>
+    """, unsafe_allow_html=True)
 
+# 2. 자산 로드
 @st.cache_resource
-def load_all_assets():
-    pkg = joblib.load('models/adidas_web_model.pkl')
-    return pkg
+def load_assets():
+    # 모델 파일 경로가 정확한지 확인하세요 (models/ 폴더 내)
+    return joblib.load('models/adidas_web_model.pkl')
 
-pkg = load_all_assets()
+pkg = load_assets()
 
-# 사이드바
-st.sidebar.header("🔍 설정")
-selected_retailer = st.sidebar.selectbox("리테일러", pkg['le_retailer'].classes_)
-selected_product = st.sidebar.selectbox("품목", pkg['le_product'].classes_)
-target_growth = st.sidebar.slider("목표 성장률 (%)", -100, 100, 10) # 범위를 넓게 잡아서 테스트
+# 3. 매장 및 제품 정의
+store_types = {
+    "🏬 대형 플래그십": {"cluster": 2, "color": "#1f77b4", "price": 55},
+    "💰 프리미엄 매장": {"cluster": 3, "color": "#2ca02c", "price": 46},
+    "🛒 박리다매 매장": {"cluster": 0, "color": "#ff7f0e", "price": 37},
+    "📍 지역 표준 매장": {"cluster": 1, "color": "#d62728", "price": 31}
+}
+product_categories = list(pkg['le_product'].classes_)
 
-# 예측 함수
-def get_prediction(retailer, product, growth):
-    ret_enc = pkg['le_retailer'].transform([retailer])[0]
+# --- 가상 뉴스 데이터베이스 (최신순 3개 필터링용) ---
+news_db = [
+    {"date": "2026-02-24", "title": "뉴욕/LA 플래그십 매장 '삼바' 재고 품귀", "sentiment": 0.8, "tags": [2, "SF"]},
+    {"date": "2026-02-23", "title": "아디다스 의류(AP) 북미 매출 20% 급등", "sentiment": 0.9, "tags": ["AP"]},
+    {"date": "2026-02-22", "title": "물류 대란으로 인한 운동화 입고 2주 지연", "sentiment": -0.6, "tags": [1, 0, "AF", "SF"]},
+    {"date": "2026-02-21", "title": "고금리 영향으로 프리미엄 소비 심리 위축", "sentiment": -0.4, "tags": [3]},
+    {"date": "2026-02-20", "title": "러닝화 신제품 'Adizero' 마케팅 캠페인 시작", "sentiment": 0.7, "tags": ["SF"]}
+]
+
+# --- 사이드바 제어판 ---
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/commons/2/20/Adidas_Logo.svg", width=50)
+    st.header("Control Panel")
+    selected_type = st.selectbox("🏠 매장 유형", options=list(store_types.keys()))
+    selected_prod_cat = st.sidebar.selectbox("👟 제품군", options=product_categories)
+    forecast_horizon = st.sidebar.slider("📅 예측(월)", 1, 12, 6)
+    growth_input = st.sidebar.slider("📈 추가 성장률(%)", -50, 50, 0)
+
+# --- 데이터 엔진 (증감율 계산 로직 포함) ---
+def get_simulation_data(cluster, product, horizon, growth):
+    current_date = datetime.now()
+    data = []
+    ret_enc = pkg['le_retailer'].transform([pkg['le_retailer'].classes_[0]])[0]
     prod_enc = pkg['le_product'].transform([product])[0]
     
-    predict_df = pd.DataFrame({
-        'Retailer_ID_Enc': [ret_enc] * 12,
-        'Product_Type_Enc': [prod_enc] * 12,
-        'Month': list(range(1, 13)),
-        'Cluster': [1] * 12
-    })
-    
-    preds = pkg['model'].predict(predict_df[pkg['features']])
-    
-    # [중요] 성장률 적용
-    adjusted_preds = preds * (1 + growth / 100)
-    
-    avg_price = pkg['price_map'].get((retailer, product), 50)
-    avg_sf = pkg['sf_map'].get((retailer, product), 1.0)
-    monthly_sales = adjusted_preds * avg_price * avg_sf
-    
-    return adjusted_preds, monthly_sales
+    prev_units = None
+    for i in range(0, horizon + 1):
+        target = current_date + relativedelta(months=i)
+        feat = pd.DataFrame([[ret_enc, prod_enc, target.month, cluster]], columns=pkg['features'])
+        pred = pkg['model'].predict(feat)[0]
+        if i > 0: pred *= (1 + growth / 100)
+        
+        current_units = int(pred)
+        
+        # [증감율 계산] 소수점 둘째자리에서 반올림하여 첫째자리까지 표시
+        change_pct = 0.0
+        if prev_units is not None and prev_units != 0:
+            change_pct = round(((current_units - prev_units) / prev_units) * 100, 1)
+        
+        data.append({
+            "Month": "현재" if i == 0 else target.strftime("%y년 %m월"),
+            "Units": current_units,
+            "Change": change_pct,
+            "Type": "Actual" if i == 0 else "Forecast"
+        })
+        prev_units = current_units
+    return pd.DataFrame(data)
 
-units, sales = get_prediction(selected_retailer, selected_product, target_growth)
-# [추가] 눈금 고정을 위한 기준값 계산 
-# 성장률이 0%일 때를 기준으로 약 2배 정도의 여유 공간을 둡니다.
-# 이렇게 해야 슬라이더를 올릴 때 그래프가 천장으로 솟구치는 효과가 납니다.
-base_units, base_sales = get_prediction(selected_retailer, selected_product, 0)
-max_unit_limit = base_units.max() * 2.5  # 고정 눈금 (수량)
-max_sales_limit = base_sales.max() * 2.5 # 고정 눈금 (매출)
-# 화면 구성
-col1, col2 = st.columns([2, 1])
+df = get_simulation_data(store_types[selected_type]['cluster'], selected_prod_cat, forecast_horizon, growth_input)
 
-with col1:
-    st.subheader(f"📅 2026 {selected_retailer} 실시간 시뮬레이션")
-    
-    chart_data = pd.DataFrame({
-        "월": [f"{m}월" for m in range(1, 13)],
-        "수량": units,
-        "매출액": sales
-    })
-    
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    
-    # 1. 막대 그래프 (수량)
-    sns.barplot(x="월", y="수량", data=chart_data, ax=ax1, color="skyblue", alpha=0.8)
-    ax1.set_ylabel("예상 판매 수량 (Pcs)", color="blue", fontsize=12)
-    
-    # [핵심] Y축 눈금 고정!
-    ax1.set_ylim(0, max_unit_limit) 
+# --- 본문 레이아웃 ---
+tab1, tab2 = st.tabs(["🚀 시뮬레이션 대시보드", "📰 전체 뉴스 관리"])
 
-    # 2. 꺾은선 그래프 (매출) - 오른쪽 축
-    ax2 = ax1.twinx()
-    sns.lineplot(x="월", y="매출액", data=chart_data, ax=ax2, marker='o', color='red', linewidth=3)
-    ax2.set_ylabel("예상 매출액 ($)", color="red", fontsize=12)
+with tab1:
+    st.subheader(f"📊 {selected_type} 시나리오 분석: {selected_prod_cat}")
     
-    # [핵심] Y축 눈금 고정!
-    ax2.set_ylim(0, max_sales_limit)
+    col_left, col_right = st.columns([1.6, 1])
 
-    # 그래프 격자 추가 (변화를 더 잘 보이게 함)
-    ax1.grid(True, axis='y', linestyle='--', alpha=0.5)
-    
-    plt.title(f"{selected_product} 성장률 {target_growth}% 적용 결과", fontsize=15)
-    st.pyplot(fig)
 
-with col2:
-    st.subheader("🤖 AI 리포트")
-    total_sales = sales.sum()
+    with col_left:
+        # 그래프 영역
+        y_max = df['Units'].max() * 2.2
+        fig = go.Figure()
+
+        # 막대 그래프 (호버 시 매출량 + 증감율 표시)
+        fig.add_trace(go.Bar(
+            x=df['Month'], 
+            y=df['Units'], 
+            customdata=df['Change'],
+            marker_color=[store_types[selected_type]['color'] if t=="Forecast" else "lightgrey" for t in df['Type']], 
+            name="판매량",
+            hovertemplate="<b>%{x}</b><br>매출량: %{y:,} Pcs<br>전달대비: %{customdata:+.1f}%<extra></extra>"
+        ))
+        
+        # 추세선 (선 그래프)
+        fig.add_trace(go.Scatter(
+            x=df['Month'], y=df['Units'], 
+            mode='lines+markers', 
+            line=dict(color='black', width=3),
+            hoverinfo="skip" # 선은 호버 생략하여 막대에 집중
+        ))
+
+        fig.update_layout(
+            height=460, 
+            margin=dict(l=0, r=0, t=10, b=0),
+            yaxis=dict(range=[0, y_max], tickfont=dict(size=14), title="수량 (Pcs)"),
+            xaxis=dict(tickfont=dict(size=14)),
+            hoverlabel=dict(bgcolor="white", font_size=20, font_family="Malgun Gothic"),
+            hovermode="closest", 
+            template="plotly_white", 
+            showlegend=False
+        )
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+    with col_right:
+        # 1. 주요 지표 요약
+        st.markdown("##### 📈 핵심 예측 지표")
+        t_units = df[df['Type']=="Forecast"]['Units'].sum()
+        t_rev = t_units * store_types[selected_type]['price']
+        
+        c1, c2 = st.columns(2)
+        c1.metric("📦 총 예상 판매", f"{t_units:,} Pcs")
+        c2.metric("💵 총 예상 매출", f"${t_rev:,}")
+        st.divider()
+
+        # 2. 관련 뉴스 자동 매칭 (최신순 최대 3개)
+        st.markdown("##### 🔍 맞춤 타겟 뉴스 (최신 3)")
+        rel_news = [n for n in news_db if store_types[selected_type]['cluster'] in n['tags'] or selected_prod_cat in n['tags']]
+        display_news = rel_news[:3] # 최신 3개만 필터링
+        
+        if not display_news:
+            st.caption("현재 조건과 관련된 최신 뉴스가 없습니다.")
+        for n in display_news:
+            color = "#1E88E5" if n['sentiment'] > 0 else "#E53935"
+            st.markdown(f"<p class='small-font'>• <b style='color:{color};'>[{'호재' if n['sentiment']>0 else '악재'}]</b> {n['title']}</p>", unsafe_allow_html=True)
+
+        # 3. AI 추천 전략
+        st.markdown("##### 🤖 AI 비즈니스 가이드")
+        with st.container(border=True):
+            if growth_input > 15: 
+                st.warning(f"**공격적 확장:** {selected_prod_cat} 인벤토리를 평소보다 30% 추가 확보하십시오.")
+            elif growth_input < 0: 
+                st.error(f"**재고 리스크:** 수요 감소가 예상됩니다. 할인 프로모션을 통해 회전율을 높이십시오.")
+            else: 
+                st.success(f"**안정 유지:** 현재 시장 흐름과 일치합니다. 기존 마케팅 비용을 유지하십시오.")
+
+with tab2:
+    st.subheader("📰 Adidas USA Market Intelligence Center")
+    col1, col2, col3 = st.columns(3)
     
-    # 변화를 확인하기 위한 지표
-    st.metric("총 매출액", f"${total_sales:,.0f}", f"{target_growth}%")
-    st.metric("총 판매수량", f"{units.sum():,.0f} Pcs")
-    
-    if target_growth > 20:
-        st.error("🚨 공격적 목표: 재고 확보 필수")
-    elif target_growth < -10:
-        st.warning("⚠️ 수요 감소: 할인 행사 준비")
-    else:
-        st.success("✅ 적정 목표: 현재 공급망 유지")
+    with col1:
+        st.info("🟢 긍정적 소식")
+        for n in [x for x in news_db if x['sentiment'] > 0]:
+            st.write(f"✅ {n['title']}")
+    with col2:
+        st.error("🔴 주의 요망")
+        for n in [x for x in news_db if x['sentiment'] < 0]:
+            st.write(f"🚨 {n['title']}")
+    with col3:
+        st.success("📊 인사이트 요약")
+        st.write(f"- 분석 품목: {selected_prod_cat}")
+        st.write(f"- 클러스터 {store_types[selected_type]['cluster']} 영향도 점검 완료")
